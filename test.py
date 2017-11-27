@@ -1,0 +1,1 @@
+#this should be like train.py, but with temperature turned down to 1.0 & with argmax used instead of multinomial sampling
