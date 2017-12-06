@@ -62,6 +62,7 @@ def get_args():
     parser.add_argument('--no-vis', action='store_true', default=False,
                         help='disables visdom visualization')
 
+    parser.add_argument('--max-latent-dim', type=int, default=512)
     parser.add_argument('--iwass-epsilon', type=float, default=0.001,
                         help='additional penalty term to keep the scores from drifting too far from zero')
 
@@ -70,8 +71,18 @@ def get_args():
     parser.add_argument('--tanh-constant', type=float, default=2.5,
                     help='tanh constant for controllers logits')
 
+    parser.add_argument('--save', type=str2bool, default=False)
+    parser.add_argument('--load', type=str2bool, default=False)
+    parser.add_argument('--min-res', type=int, default=4)
+
+    # switches used in our experiments:
+
+    # To sample 10,000 architectures or do early stop for the final selection of arch
+    parser.add_argument('--full-arch-selection', type=bool, default=True,
+                        help='this is just to see how the score will converge, probably not practical option')
+
     parser.add_argument('--incept-start-epoch', type=int, default=0,
-                        help='number of epochs until inception effects controller loss')
+                        help='number of epochs until inception affects controller loss')
 
     parser.add_argument('--g-GAN-loss-coef', type=float, default=1.0,
                     help='how much of GAN loss to use for g control')
@@ -82,9 +93,19 @@ def get_args():
     parser.add_argument('--d-Incept-loss-coef', type=float, default=1.0,
                     help='how much of Incept loss to use for d control')
 
-    parser.add_argument('--save', type=str2bool, default=False)
-    parser.add_argument('--load', type=str2bool, default=False)
-
+    parser.add_argument('--prog-unit', type=int, default=2)
+    parser.add_argument('--twin', type=bool, default=True,
+                        help='whether to use twin controllers or a single one')
+    parser.add_argument('--symmetry', type=bool, default=False,
+                        help='whether to restrict archs to be symmetric or not (need twin=False)')
+    parser.add_argument('--latent-dim-optim', type=bool, default=False,
+                        help='whether to allow the latent dimension to be optimized for')
+    parser.add_argument('--prog', type=bool, default=False,
+                        help='whether to allow progressive growing')
+    parser.add_argument('--loss-optim', type=bool, default=False,
+                        help='whether to optimize loss function')
+    parser.add_argument('--loss-mix', type=bool, default=False,
+                        help='whether to optimize mixed loss function')
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
