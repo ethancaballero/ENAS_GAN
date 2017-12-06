@@ -31,7 +31,7 @@ use_cuda = args.cuda
 DIM = 512  # This overfits substantially; you're probably better off with 64
 LAMBDA = 10  # Gradient penalty lambda hyperparameter
 iwass_target = 750.0
-CRITIC_ITERS = 1  # How many critic iterations per generator iteration
+CRITIC_ITERS = 5  # How many critic iterations per generator iteration
 BATCH_SIZE = 16  # Batch size
 BATCH_SIZE_EVAL = 100
 
