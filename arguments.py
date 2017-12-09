@@ -78,6 +78,9 @@ def get_args():
     # switches used in our experiments:
 
     # To sample 10,000 architectures or do early stop for the final selection of arch
+    parser.add_argument('--ENAS-GAN-ver', type=int, default=2,
+                        help='1 leads to an older search space, 2 to the newer one')
+
     parser.add_argument('--full-arch-selection', type=bool, default=True,
                         help='this is just to see how the score will converge, probably not practical option')
 
