@@ -8,4 +8,4 @@ to run:
 Make sure to change the names of saved models (or back them up somewhere) before running new models that will be saved, because the new saved models will overwrite the old saved models if old saved models have default names.
 
 ## Dependencies
-pytorch v0.2
+pytorch v0.2 or v0.3
