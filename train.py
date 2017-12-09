@@ -16,16 +16,21 @@ import tflib as lib
 import tflib.save_images
 import tflib.mnist
 import tflib.cifar10
-import tflib.plot
 import tflib.inception_score
 
 from functools import reduce
 
-import ENAS_GAN
 from utils_GAN import generate_image, get_inception_score, preprocess
 from storage import RolloutStorage
 
 args = get_args()
+
+if args.ENAS_GAN_ver == 1:
+    import ENAS_GAN as ENAS_GAN
+elif args.ENAS_GAN_ver == 2:
+    import ENAS_GAN2 as ENAS_GAN
+else:
+    NotImplementedError
 
 use_cuda = args.cuda
 DIM = 512  # This overfits substantially; you're probably better off with 64
@@ -43,12 +48,17 @@ epochs = 300
 M1 = 1  # number of paths used to update Shared Parameters omega in Step 1
 M2 = 10  # number of paths used to update Policy Parameters theta in Step 2
 
-netG = ENAS_GAN.G(args, 32)
-netD = ENAS_GAN.D(args, 32)
+netG = ENAS_GAN.G(32)
+netD = ENAS_GAN.D(32)
 # ^D should assign high values to real & low values (e.g. 0) to fake
 
-C_DIM = 64
-vocab_size = 2 ** ENAS_GAN.R
+if args.ENAS_GAN_ver == 1:
+    C_DIM = 64
+    vocab_size = 2 ** ENAS_GAN.R
+elif args.ENAS_GAN_ver == 2:
+    C_DIM = 64
+    vocab_size = netG.vocab_size()
+
 cG = rnn_controller.Controller(args=args, dim=C_DIM, vocab_size=vocab_size)
 cD = rnn_controller.Controller(args=args, dim=C_DIM, vocab_size=vocab_size)
 
