@@ -398,6 +398,7 @@ for e in range(epochs):
             optimizerCD.zero_grad()
 
             cD_loss.backward()
+            nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
             optimizerCD.step()
 
             rolloutsD.update_avg_reward_GAN()
@@ -517,6 +518,7 @@ for e in range(epochs):
         '''^TODO IMMEDIATE: MAKE SURE mean &/or sum of logprobs & ents are correct'''
 
         cG_loss.backward()
+        nn.utils.clip_grad_norm(cG.parameters(), args.max_grad_norm)
         optimizerCG.step()
 
         rolloutsG.update_avg_reward_GAN()
@@ -576,6 +578,7 @@ for e in range(epochs):
             optimizerCD.zero_grad()
 
             cD_loss.backward()
+            nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
             optimizerCD.step()
 
             # rolloutsD.update_avg_reward_GAN()
