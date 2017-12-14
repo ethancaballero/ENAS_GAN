@@ -12,6 +12,8 @@ from torch.nn import Parameter as P
 from torch.autograd import Variable as V
 from arguments import get_args
 
+import gc
+
 args = get_args()
 
 # The unit of adjustable channels, S, is equal to max_ch/R, where R is set to be 8 by default.
@@ -41,6 +43,7 @@ class Agent(nn.Module):
         # is a good estimate of how many channels per layer there are in a given block
         # If num_blocks=4, the following plan goes like, for G, 512(latent)-> 256*2 (1st layer)-> 128*2-> 64*2-> 32*2
         # where we listed 2*(base channel number)'s
+        #if stage==0: return 256
         return 512 // (2 ** stage)
 
     def _make_trans(self, type):
@@ -61,12 +64,15 @@ class Agent(nn.Module):
     def vocab_size(self):
         return 5
 
+    def _make_layer(self, a, b, c):
+        return [Layer(a,b,c)]
+
     def forward(self, x, code):
         return NotImplementedError
 
 
 class G(Agent):
-    def __init__(self, resolution, layers_per_block=5):
+    def __init__(self, resolution, layers_per_block=3):
         super(G, self).__init__(resolution, layers_per_block)
 
         # stemconv: 1x1 output to 4x4 output
@@ -79,7 +85,7 @@ class G(Agent):
         for i in range(1, self.num_blocks):
             self.blocks += self._make_block(self.nf(i + 1), self.nf(i), 1, type='G')
         for i in range(self.num_blocks - 1):
-            self.transes += [Layer(self.nf(i + 1), self.nf(i + 1), self.nf(i + 2))]
+            self.transes += self._make_layer(self.nf(i + 1), self.nf(i + 1), self.nf(i + 2))
 
         self.end_conv = Conv(self.nf(self.num_blocks), 3, 1, padding=0, linear=True, norm_used=False)
 
@@ -98,24 +104,26 @@ class G(Agent):
             tmp = str(bin(code[i] % 4))[2:]
             tmp += "0" * (2 - len(tmp))
             c += tmp
-
+        if c == '00000000':
+            c = '11111111'
         params = 0  # VERY rough estimate of number of parameters
         code_normal = code[4:20]
         code_trans = code[20:36]
 
         if args.cuda:
-            zeros = V(torch.zeros(x.size(0), self.nf(0) // R).cuda(),
+            zeros = V(torch.zeros(x.size(0), self.nf(0) // 8).cuda(),
                       volatile=not self.training, requires_grad=False)
         else:
-            zeros = V(torch.zeros(x.size(0), self.nf(0) // R),
+            zeros = V(torch.zeros(x.size(0), self.nf(0) // 8),
                       volatile=not self.training, requires_grad=False)
         list = []
-        for i in range(R):
+        for i in range(8):
             if c[i] == '1':
-                list.append(x[:, (self.nf(0) // R) * i:(self.nf(0) // R) * (i + 1)])
+                list.append(x[:, (self.nf(0) // 8) * i:(self.nf(0) // 8) * (i + 1)])
             else:
                 list.append(zeros)
         x = torch.cat(list, 1)
+
         x = x.view(x.size(0), -1, 1, 1)
 
         x = pn(x)
@@ -133,12 +141,13 @@ class G(Agent):
                 x = tmp
                 del tmp
                 params += params_tmp
+        del x
         h = self.end_conv(h)
         return h, params
 
 
 class D(Agent):
-    def __init__(self, resolution, layers_per_block=5):
+    def __init__(self, resolution, layers_per_block=3):
         super(D, self).__init__(resolution, layers_per_block)
 
         self.stem_conv = Conv(3, self.nf(self.num_blocks), 1, padding=0, norm_used=False)
@@ -148,7 +157,7 @@ class D(Agent):
             self.blocks += self._make_block(self.nf(i), self.nf(i + 1), 1, type='D')
         self.blocks += self._make_block(self.nf(1), self.nf(2), 0, type='D')  # smallest block has one less layer
         for i in range(self.num_blocks, 1, -1):
-            self.transes += [Layer(self.nf(i), self.nf(i), self.nf(i - 1))]
+            self.transes += self._make_layer(self.nf(i), self.nf(i), self.nf(i - 1))
 
         self.stddev = MinibatchStatConcatLayer()
 
@@ -182,6 +191,7 @@ class D(Agent):
                 x = tmp
                 del tmp
                 params += params_tmp
+        del x
         h = self.stddev(h)
         h = self.end_conv(h)
         params += 4 * 4 * self.nf(1) * self.nf(0)
@@ -194,36 +204,35 @@ class Layer(nn.Module):
         super(Layer, self).__init__()
         self.in_ch = [in_ch1, in_ch2]
         self.out_ch = out_ch
-        if self.in_ch[0] != self.in_ch[1]:
-            self.adjust = Factorized_adjustment(in_ch1, in_ch2)
-
-        self.conv1 = nn.ModuleList()
-        for i in range(2):
-            for j in range(4):
-                self.conv1 += self._make_layer(self.in_ch[0], kernel=1, padding=0,
-                                               stride=1 if self.in_ch[0] >= self.out_ch else 2)
-        for i in range(6):
-            self.conv1 += self._make_layer(out_ch // 4, kernel=1, padding=0)
-        for k in range(3):
-            for i in range(2):
-                for j in range(4):
-                    self.conv1 += self._make_layer(self.in_ch[0], kernel=1, padding=0,
-                                                   stride=1 if self.in_ch[0] >= self.out_ch else 2)
+        self.adjust = Factorized_adjustment(in_ch1, in_ch2, out_ch)
 
         self.conv3 = nn.ModuleList()
-        for i in range(2):
-            for j in range(4):
-                self.conv3 += self._make_layer(self.in_ch[0], kernel=3, padding=1,
-                                               stride=2 if self.in_ch[0] < self.out_ch else 1)
-        for i in range(6):
-            self.conv3 += self._make_layer(out_ch // 4, kernel=3, padding=1)
+        if self.in_ch[0] == self.out_ch:
+            for i in range(2):
+                for j in range(4):
+                    self.conv3 += self._make_layer(kernel=3, padding=1)
+        else:
+            for i in range(2):
+                for j in range(4):
+                    self.conv3 += self._make_layer(kernel=2, stride=2, deconv=self.in_ch[0]>self.out_ch)
 
-    def _make_layer(self, in_ch, kernel, padding, stride=1, deconv=False):
-        return [Conv(in_ch, self.out_ch // 4, kernel, padding=padding, stride=stride, deconv=deconv)]
+        for _ in range(6):
+            self.conv3 += self._make_layer(kernel=3, padding=1)
+        self.conv5 = nn.ModuleList()
+        if self.in_ch[0] == self.out_ch:
+            for i in range(2):
+                for j in range(4):
+                    self.conv5 += self._make_layer(kernel=5, padding=2)
+        else:
+            for i in range(2):
+                for j in range(4):
+                    self.conv5 += self._make_layer(kernel=4, stride=2, padding=1, deconv=self.in_ch[0]>self.out_ch)
+        for i in range(6):
+            self.conv5 += self._make_layer(kernel=5, padding=2)
+    def _make_layer(self, kernel, padding=0, stride=1, deconv=False):
+        return [Conv(self.out_ch // 4, self.out_ch // 4, kernel, padding=padding, stride=stride, deconv=deconv)]
 
     def forward(self, h1, h2, code):
-        print(h1.size())
-
         c = [[[] for j in range(4)] for i in range(5)]
 
         for i in range(4):
@@ -240,52 +249,44 @@ class Layer(nn.Module):
         elif self.in_ch[0] < self.out_ch:
             scale = scale // 2
         if args.cuda:
-            zeros_out = V(torch.zeros(h1.size(0), self.out_ch // 4, scale, scale).cuda(),
-                          volatile=not self.training, requires_grad=False)
+            zeros_out = V(torch.zeros(h1.size(0), self.out_ch // 4, scale, scale).cuda())
         else:
-            zeros_out = V(torch.zeros(h1.size(0), self.out_ch // 4, scale, scale), volatile=not self.training,
-                          requires_grad=False)
+            zeros_out = V(torch.zeros(h1.size(0), self.out_ch // 4, scale, scale))
         h = [h1, h2]
         del h1, h2
-        if self.in_ch[0] != self.in_ch[1]:
-            h[1], p = self.adjust(h[1], params)
-            params += p
+        h, p = self.adjust(h)
+        params += p
         sum = [zeros_out] * 4
         for i in range(2):
             for j in range(4):
                 for k in c[i][j]:
-                    if k == 0:
-                        if self.in_ch[0] > self.out_ch:
-                            sum[j] = sum[j] + self.conv1[4 * i + j](F.upsample(h[i], scale_factor=2))
+                    if k == 0 or k == 4 and self.out_ch > self.in_ch[0]:
+                        sum[j] = sum[j] + self.conv3[4 * i + j](h[i])
+                        if self.in_ch[0] == self.out_ch:
+                            params += self.out_ch * self.out_ch // 16
                         else:
-                            sum[j] = sum[j] + self.conv1[4 * i + j](h[i])
-                        params += self.in_ch[0] * self.out_ch // 4
-                    if k == 1:
-                        if self.in_ch[0] > self.out_ch:
-                            sum[j] = sum[j] + self.conv3[4 * i + j](F.upsample(h[i], scale_factor=2))
+                            params += 2 * 2 * self.out_ch * self.out_ch // 16
+                    elif k == 1:
+                        sum[j] = sum[j] + self.conv5[4 * i + j](h[i])
+                        if self.in_ch[0] != self.out_ch:
+                            params += 4 * 4 * self.out_ch * self.out_ch // 16
                         else:
-                            sum[j] = sum[j] + self.conv3[4 * i + j](h[i])
-                        params += 3 * 3 * self.in_ch[0] * self.out_ch // 4
-                    if k == 2:
+                            params += 3 * 3 * self.out_ch * self.out_ch // 16
+                    elif k == 2:
                         if self.out_ch >= self.in_ch[0]:
-                            sum[j] = sum[j] + self.conv1[14 + 4 * i + j](F.avg_pool2d(h[i], 3, padding=1, stride=1))
+                            sum[j] = sum[j] + F.leaky_relu(F.avg_pool2d(h[i], 3, 2 if self.out_ch > self.in_ch[0] else 1, 1), negative_slope=0.2)
                         else:
-                            sum[j] = sum[j] + self.conv1[14 + 4 * i + j](
-                                F.upsample(F.avg_pool2d(h[i], 3, 1, 1), scale_factor=2))
-                        params += self.in_ch[0] * self.out_ch // 4
-                    if k == 3:
+                            sum[j] = sum[j] + F.leaky_relu(F.upsample(h[i], scale_factor=2), negative_slope=0.2)
+                    elif k == 3:
                         if self.out_ch >= self.in_ch[0]:
-                            sum[j] = sum[j] + self.conv1[22 + 4 * i + j](F.max_pool2d(h[i], 3, 1, 1))
+                            sum[j] = sum[j] + F.leaky_relu(F.max_pool2d(h[i], 3, 2 if self.out_ch > self.in_ch[0] else 1, 1), negative_slope=0.2)
                         else:
-                            sum[j] = sum[j] + self.conv1[22 + 4 * i + j](
-                                F.upsample(F.max_pool2d(h[i], 3, 1, 1), scale_factor=2))
-                        params += self.in_ch[0] * self.out_ch // 4
-                    if k == 4:
-                        if self.in_ch[0] > self.out_ch:
-                            sum[j] = sum[j] + self.conv1[30 + 4 * i + j](F.upsample(h[i], scale_factor=2))
+                            sum[j] = sum[j] + F.leaky_relu(F.upsample(h[i], scale_factor=2), negative_slope=0.2)
+                    elif k == 4:
+                        if self.out_ch < self.in_ch[0]:
+                            sum[j] = sum[j] + F.upsample(h[i], scale_factor=2)
                         else:
-                            sum[j] = sum[j] + self.conv1[30 + 4 * i + j](h[i])
-                        params += self.in_ch[0] * self.out_ch // 4
+                            sum[j] = sum[j] + h[i]
         del h
         for i in range(6):
             if i == 0:
@@ -308,10 +309,10 @@ class Layer(nn.Module):
                 k = 3
             for l in c[j][k]:
                 if l == 0:
-                    sum[k] = sum[k] + self.conv1[8 + i](sum[j])
+                    sum[k] = sum[k] + self.conv3[8 + i](sum[j])
                 params += self.out_ch * self.out_ch // 16
                 if l == 1:
-                    sum[k] = sum[k] + self.conv3[8 + i](sum[j])
+                    sum[k] = sum[k] + self.conv5[8 + i](sum[j])
                 params += 3 * 3 * self.out_ch * self.out_ch // 16
                 if l == 2:
                     sum[k] = sum[k] + F.leaky_relu(F.avg_pool2d(sum[j], 3, 1, 1),
@@ -320,7 +321,7 @@ class Layer(nn.Module):
                     sum[k] = sum[k] + F.leaky_relu(F.max_pool2d(sum[j], 3, 1, 1),
                                            negative_slope=0.2)
                 if l == 4:  # identity
-                    sum[k] = sum[k]
+                    sum[k] = sum[k] + sum[j]
         output = torch.cat(sum, 1)
         del sum
         return output, params
@@ -335,9 +336,11 @@ class Block(nn.Module):
         self.prev_in_ch = prev_in_ch
         self.type = type  # 'D' or 'G'
         self.layers = nn.ModuleList()
-        self.layers += [Layer(in_ch, prev_in_ch, in_ch)]
+        self.layers += self._make_layer(in_ch, prev_in_ch, in_ch)
         for i in range(self.layers_per_block - 1):
-            self.layers += [Layer(in_ch, in_ch, in_ch)]
+            self.layers += self._make_layer(in_ch, in_ch, in_ch)
+    def _make_layer(self, a, b, c):
+        return [Layer(a, b, c)]
 
     def forward(self, h1, h2, code):
 
@@ -347,9 +350,10 @@ class Block(nn.Module):
             h2 = h1
             h1 = x
             params += p
+        if self.layers_per_block != 0:
+            del x
 
         return h1, h2, params
-
 
 def pn(x):  # Pixel_norm
     return x / torch.sqrt(torch.mean(x * x, dim=1, keepdim=True) + 1e-8)
@@ -370,7 +374,6 @@ class Linear(nn.Linear):
         x = x * scale
         return x + torch.unsqueeze(self.bias, 0)
 
-
 class Conv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size,
                  padding, stride=1, deconv=False, linear=False, norm_used=True):
@@ -387,7 +390,6 @@ class Conv(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-
 class Conv_transpose(nn.ConvTranspose2d):
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, linear=False, norm_used=True):
@@ -403,12 +405,12 @@ class Conv_transpose(nn.ConvTranspose2d):
         # x = F.conv_transpose2d(x, self.weight, stride=self.stride, padding=self.padding)
 
         x = x * scale
+        del scale
         if not self.linear:
             x = F.leaky_relu(x, negative_slope=0.2)
         if self.norm_used:
             x = pn(x)
         return x
-
 
 # Basically the same as Conv_transpose except that it's nn.Conv2d counterpart...
 # I'm not sure whether I can merge them, since inheritance would be inconsistent if merged
@@ -427,12 +429,12 @@ class Conv_regular(nn.Conv2d):
                      padding=self.padding)
         # x = F.conv2d(x, self.weight, stride=self.stride, padding=self.padding)
         x = x * scale
+        del scale
         if not self.linear:
             x = F.leaky_relu(x, negative_slope=0.2)
         if self.norm_used:
             x = pn(x)
         return x
-
 
 # This is used for transition
 class Scale(nn.Module):
@@ -465,19 +467,23 @@ class MinibatchStatConcatLayer(nn.Module):
 
 
 class Factorized_adjustment(nn.Module):
-    def __init__(self, in_ch, prev_in_ch):
+    def __init__(self, in_ch, prev_in_ch, out_ch):
         super(Factorized_adjustment, self).__init__()
         self.in_ch = in_ch
         self.prev_in_ch = prev_in_ch
-        self.conv = Conv(prev_in_ch, in_ch, 1, padding=0)
+        self.out_ch = out_ch
+        self.conv1 = Conv(in_ch, out_ch//4, 1, padding=0)
+        self.conv2 = Conv(prev_in_ch, out_ch//4, 1, padding=0)
 
-    def forward(self, x, params):
-        params += self.in_ch * self.prev_in_ch
-        if self.prev_in_ch > self.in_ch:
-            return self.conv(F.upsample(x, scale_factor=2)), params
-        else:
-            return self.conv(F.avg_pool2d(x, 3, padding=1, stride=2)), params
+    def forward(self, h):
+        if self.prev_in_ch < self.in_ch:
+            h[1] = F.avg_pool2d(h[1], 3, padding=1, stride=2)
+        elif self.prev_in_ch > self.in_ch:
+            h[1] = F.upsample(h[1], scale_factor=2)
 
+        h[0] = self.conv1(h[0])
+        h[1] = self.conv2(h[1])
+        return h, self.prev_in_ch * self.out_ch // 4 + self.in_ch * self.out_ch // 4
 
 def weights_init(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
@@ -488,24 +494,31 @@ def weights_init(m):
 
 
 # For testing:
-
+'''
 g = G(32)
 d = D(32)
 g.apply(weights_init)
 d.apply(weights_init)
-#d.apply(weights_init)
-print(d.required_code_length())
-coded, codeg = [], []
-for i in range(g.required_code_length()):
-    codeg.append(r.randint(0,4))
-for i in range(d.required_code_length()):
-    coded.append(r.randint(0,4))
+
 from functools import reduce
 
-y,_=g(V(torch.randn(2,512),volatile=True),codeg)
-x=d(y,coded)
-print(y,x)
+for i in range(30):
+    coded, codeg = [], []
+    for _ in range(g.required_code_length()):
+        codeg.append(r.randint(0, 4))
+    for _ in range(d.required_code_length()):
+        coded.append(r.randint(0, 4))
+    g.zero_grad()
+    d.zero_grad()
+    print(i)
+    y,_=g(V(torch.randn(16,512)),codeg)
+    x=d(y,coded)[0].mean()
+    x.backward()
+    del x,y
+    m = int(open('/proc/self/statm').read().split()[1])
+    print("consuming extra {:.1f} MB".format(m / 256))
 
+'''
 # print(d(x,code))
 # gp = sum([reduce(lambda x, y: x * y, p.size()) for p in g.parameters()])
 # dp = sum([reduce(lambda x, y: x * y, p.size()) for p in d.parameters()])
@@ -513,4 +526,3 @@ print(y,x)
 # print(gp)
 # print(dp)
 
-# print(g(V(torch.randn(2,512)),code))
