@@ -22,6 +22,7 @@ from functools import reduce
 
 from utils_GAN import generate_image, get_inception_score, preprocess
 from storage import RolloutStorage
+from train_pi_utils import rollout_ppo
 
 args = get_args()
 
@@ -172,7 +173,7 @@ for e in range(epochs):
     '''
     # Step 1: Training the Shared Parameters omega
     '''
-    # """
+    #"""
     for iteration in range(num_of_data_point // (BATCH_SIZE * CRITIC_ITERS)):
         print("iteration", iteration)
         '''TODO: batch sampling of codes'''
@@ -287,7 +288,7 @@ for e in range(epochs):
         if args.cuda:
             save_model = copy.deepcopy(netD).cpu()
         torch.save(save_model, os.path.join(save_path, "netD" + ".pt"))
-        # """
+        #"""
 
     print("Step 2")
     '''
@@ -322,6 +323,8 @@ for e in range(epochs):
             codesD = [[] for _ in range(M2)]
             action = V(torch.LongTensor([[0] for _ in range(M2)]))
             h_state = None
+            if args.ppo:
+                action_list = []
             for _i in range(netD.required_code_length()):
                 get_value = True if _i == netD.required_code_length() - 1 else False
                 # value, action, h_state = cD.act(action, h_state, get_value=get_value)
@@ -332,7 +335,12 @@ for e in range(epochs):
 
                 action_log_probs_list.append(action_log_probs)
                 dist_entropy_list.append(dist_entropy)
+                if args.ppo:
+                    action_list.append(action.data)
+
             rolloutsD.insert(torch.stack(action_log_probs_list), torch.stack(dist_entropy_list), value)
+            if args.ppo:
+                rolloutsD.insert_actions(torch.stack(action_list))
 
             for j in range(M2):
                 _data = gen.__next__()
@@ -381,29 +389,67 @@ for e in range(epochs):
                 # D_cost is the negative reward
                 D_reward = -D_cost
 
+
                 # D_rewards.append(D_reward)
                 rolloutsD.insert_reward_GAN(j, D_reward.data)
 
                 Wasserstein_D = D_real - D_fake
 
+
                 '''TODO: discrim's inception loss'''
 
             '''TODO: discrim's inception loss is at bottom. should it be done here 5 times instead?'''
 
-            cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * V((
-                                                                  rolloutsD.rewards_GAN - rolloutsD.avg_reward_GAN) * args.d_GAN_loss_coef)).mean() - rolloutsD.ents.mean(
-                0) * args.entropy_coef
+            if args.ppo:
+                #print("rolloutsD.actions", rolloutsD.actions)
+                perm = torch.randperm(M2)
+                actions_old = rolloutsD.actions
+                logprobs_old = rolloutsD.logprobs
+                #ents_old = rolloutsD.ents
 
-            # just in case gradient penalty steps caused gradients
-            optimizerCD.zero_grad()
 
-            cD_loss.backward()
-            nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
-            optimizerCD.step()
+                #advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+                advantages = rolloutsD.rewards_GAN - rolloutsD.avg_reward_GAN
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+
+                for j in range(0, M2, M2//args.ppo_epochs):
+                    perm_indeces = perm[j:j+M2//args.ppo_epochs]
+                    values, action_log_probs, dist_entropy = rollout_ppo(args, torch.index_select(actions_old, 1, perm_indeces), netD, cD)
+
+                    old_action_log_probs_batch = torch.index_select(logprobs_old, 1, V(perm_indeces))
+
+                    adv_targ = V(advantages[perm_indeces])
+                    ratio = torch.exp(action_log_probs - V(old_action_log_probs_batch.data))
+                    surr1 = ratio * adv_targ
+                    surr2 = torch.clamp(ratio, 1.0 - args.clip_param, 1.0 + args.clip_param) * adv_targ
+                    action_loss = -torch.min(surr1, surr2).mean() # PPO's pessimistic surrogate (L^CLIP)
+
+                    #value_loss = (V(return_batch) - values).pow(2).mean()
+                    value_loss = 0.0
+
+                    optimizerCD.zero_grad()
+                    (value_loss + action_loss * args.d_GAN_loss_coef - dist_entropy.mean() * args.entropy_coef).backward()
+                    nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
+                    optimizerCD.step()
+
+                #rollouts.after_update()
+
+
+            else:
+                cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * V((
+                    rolloutsD.rewards_GAN - rolloutsD.avg_reward_GAN) * args.d_GAN_loss_coef)).mean() - rolloutsD.ents.mean(
+                    0) * args.entropy_coef
+
+                # just in case gradient penalty steps caused gradients
+                optimizerCD.zero_grad()
+
+                cD_loss.backward()
+                nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
+                optimizerCD.step()
 
             rolloutsD.update_avg_reward_GAN()
-            '''TODO: is discrim incept reward different than generats incept reward'''
-            rolloutsD.update_avg_reward_INCEPT()
+            '''TODO: is discrim incept reward different than generates incept reward'''
+            #rolloutsD.update_avg_reward_INCEPT()
 
         # gets new codesD after controlD update, in order to update controlG
         codesD = [[] for _ in range(M2)]
@@ -414,6 +460,8 @@ for e in range(epochs):
         else:
             action = V(torch.LongTensor([[0] for _ in range(M2)]), volatile=True)
         h_state_D = None
+        if args.ppo:
+            action_list = []
         for i in range(netD.required_code_length()):
             if args.incept_start_epoch >= e:
                 get_value = True if i == netG.required_code_length() - 1 else False
@@ -424,6 +472,10 @@ for e in range(epochs):
                 get_value = False
                 value, action, h_state_D = cD.act(action, h_state_D, get_value=get_value)
 
+            '''TODO: you might want to put this inside of "if args.incept_start_epoch >= e:"'''
+            if args.ppo:
+                action_list.append(action.data)
+
             for cdx, _c in enumerate(action.data.squeeze(1).cpu().numpy()):
                 codesD[cdx].append(_c)
 
@@ -433,12 +485,16 @@ for e in range(epochs):
         if args.incept_start_epoch >= e:
             rolloutsD.insert(torch.stack(action_log_probs_list_D_incept), torch.stack(dist_entropy_list_D_incept),
                              value)
+            if args.ppo:
+                rolloutsD.insert_actions(torch.stack(action_list))
 
         codesG = [[] for _ in range(M2)]
         action = V(torch.LongTensor([[0] for _ in range(M2)]))
         action_log_probs_list = []
         dist_entropy_list = []
         h_state_G = None
+        if args.ppo:
+            action_list = []
         for i in range(netG.required_code_length()):
             get_value = True if i == netG.required_code_length() - 1 else False
             value, action, h_state_G, action_log_probs, dist_entropy = cG.act_and_evaluate(V(action.data), h_state_G,
@@ -448,7 +504,11 @@ for e in range(epochs):
 
             action_log_probs_list.append(action_log_probs)
             dist_entropy_list.append(dist_entropy)
+            if args.ppo:
+                action_list.append(action.data)
         rolloutsG.insert(torch.stack(action_log_probs_list), torch.stack(dist_entropy_list), value)
+        if args.ppo:
+            rolloutsG.insert_actions(torch.stack(action_list))
 
         ############################
         # (2) Update G controller
@@ -491,6 +551,7 @@ for e in range(epochs):
                     noise = noise.cuda(gpu)
                 noisev = autograd.Variable(noise)
                 fake = netG(noisev, codesG[j % M2])
+                fake = fake[0]
 
                 fake = F.relu(fake)
                 incept_inp = fake.cpu().data.numpy()
@@ -510,16 +571,51 @@ for e in range(epochs):
 
         '''TODO IMMEDIATE: MAKE SURE ROLLOUT STORAGE COPY DOESN'T DETACH GRADIENTS/GRAPH'''
 
-        cG_loss = -(rolloutsG.logprobs.mean(0).squeeze(1) * V(
-            (rolloutsG.rewards_GAN - rolloutsG.avg_reward_GAN) * args.g_GAN_loss_coef + (
-            rolloutsG.rewards_INCEPT - rolloutsG.avg_reward_INCEPT) * args.g_Incept_loss_coef)).mean() - rolloutsG.ents.mean(
-            0) * args.entropy_coef
 
-        '''^TODO IMMEDIATE: MAKE SURE mean &/or sum of logprobs & ents are correct'''
+        if args.ppo:
+            #print("rolloutsD.actions", rolloutsG.actions)
+            perm = torch.randperm(M2)
+            actions_old = rolloutsG.actions
+            logprobs_old = rolloutsG.logprobs
+            #ents_old = rolloutsD.ents
 
-        cG_loss.backward()
-        nn.utils.clip_grad_norm(cG.parameters(), args.max_grad_norm)
-        optimizerCG.step()
+
+            #advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+            #advantages = rolloutsD.rewards_GAN - rolloutsD.avg_reward_GAN
+            advantages = (rolloutsG.rewards_GAN - rolloutsG.avg_reward_GAN) * args.g_GAN_loss_coef + (rolloutsG.rewards_INCEPT - rolloutsG.avg_reward_INCEPT) * args.g_Incept_loss_coef
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+
+            for j in range(0, M2, M2//args.ppo_epochs):
+                perm_indeces = perm[j:j+M2//args.ppo_epochs]
+                values, action_log_probs, dist_entropy = rollout_ppo(args, torch.index_select(actions_old, 1, perm_indeces), netG, cG)
+
+                old_action_log_probs_batch = torch.index_select(logprobs_old, 1, V(perm_indeces))
+
+                adv_targ = V(advantages[perm_indeces])
+                ratio = torch.exp(action_log_probs - V(old_action_log_probs_batch.data))
+                surr1 = ratio * adv_targ
+                surr2 = torch.clamp(ratio, 1.0 - args.clip_param, 1.0 + args.clip_param) * adv_targ
+                action_loss = -torch.min(surr1, surr2).mean() # PPO's pessimistic surrogate (L^CLIP)
+
+                #value_loss = (V(return_batch) - values).pow(2).mean()
+                value_loss = 0.0
+
+                optimizerCG.zero_grad()
+                (value_loss + action_loss - dist_entropy.mean() * args.entropy_coef).backward()
+                nn.utils.clip_grad_norm(cG.parameters(), args.max_grad_norm)
+                optimizerCG.step()
+
+        else:
+            cG_loss = -(rolloutsG.logprobs.mean(0).squeeze(1) * V(
+                (rolloutsG.rewards_GAN - rolloutsG.avg_reward_GAN) * args.g_GAN_loss_coef + (
+                rolloutsG.rewards_INCEPT - rolloutsG.avg_reward_INCEPT) * args.g_Incept_loss_coef)).mean() - rolloutsG.ents.mean(
+                0) * args.entropy_coef
+
+            '''^TODO IMMEDIATE: MAKE SURE mean &/or sum of logprobs & ents are correct'''
+
+            cG_loss.backward()
+            nn.utils.clip_grad_norm(cG.parameters(), args.max_grad_norm)
+            optimizerCG.step()
 
         rolloutsG.update_avg_reward_GAN()
         # rolloutsG.update_avg_reward_INCEPT()
@@ -537,6 +633,8 @@ for e in range(epochs):
             action_log_probs_list = []
             dist_entropy_list = []
             h_state_G = None
+            if args.ppo:
+                action_list = []
             for i in range(netG.required_code_length()):
                 get_value = True if i == netG.required_code_length() - 1 else False
                 value, action, h_state_G = cG.act(action, h_state_G, get_value=get_value)
@@ -566,20 +664,53 @@ for e in range(epochs):
                 rolloutsD.insert_reward_INCEPT(j, torch.Tensor([float(D_incept_reward_mean)]))
 
             '''TODO IMMEDIATE: should you also use avg baseline on diff of INCEPT loss between updates'''
-            # cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * ((rolloutsD.rewards_INCEPT-rolloutsG.rewards_INCEPT)) * args.d_Incept_loss_coef).mean() - rolloutsD.ents.mean(0) * args.entropy_coef
-            cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * V(
-                (rolloutsD.rewards_INCEPT - rolloutsG.rewards_INCEPT) - (
-                rolloutsD.avg_reward_INCEPT - rolloutsG.avg_reward_INCEPT)) * args.d_Incept_loss_coef).mean() - rolloutsD.ents.mean(
-                0) * args.entropy_coef
+            if args.ppo:
+                print("rolloutsD.actions", rolloutsD.actions)
+                perm = torch.randperm(M2)
+                actions_old = rolloutsD.actions
+                logprobs_old = rolloutsD.logprobs
+                #ents_old = rolloutsD.ents
 
-            '''^TODO IMMEDIATE: MAKE SURE mean &/or sum of logprobs & ents are correct'''
 
-            # just in case gradient penalty steps caused gradients
-            optimizerCD.zero_grad()
+                #advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
+                #advantages = rolloutsD.rewards_GAN - rolloutsD.avg_reward_GAN
+                advantages = ((rolloutsD.rewards_INCEPT - rolloutsG.rewards_INCEPT) - (rolloutsD.avg_reward_INCEPT - rolloutsG.avg_reward_INCEPT)) * args.d_Incept_loss_coef
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
 
-            cD_loss.backward()
-            nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
-            optimizerCD.step()
+                for j in range(0, M2, M2//args.ppo_epochs):
+                    perm_indeces = perm[j:j+M2//args.ppo_epochs]
+                    values, action_log_probs, dist_entropy = rollout_ppo(args, torch.index_select(actions_old, 1, perm_indeces), netD, cD)
+
+                    old_action_log_probs_batch = torch.index_select(logprobs_old, 1, V(perm_indeces))
+
+                    adv_targ = V(advantages[perm_indeces])
+                    ratio = torch.exp(action_log_probs - V(old_action_log_probs_batch.data))
+                    surr1 = ratio * adv_targ
+                    surr2 = torch.clamp(ratio, 1.0 - args.clip_param, 1.0 + args.clip_param) * adv_targ
+                    action_loss = -torch.min(surr1, surr2).mean() # PPO's pessimistic surrogate (L^CLIP)
+
+                    #value_loss = (V(return_batch) - values).pow(2).mean()
+                    value_loss = 0.0
+
+                    optimizerCD.zero_grad()
+                    (value_loss + action_loss - dist_entropy.mean() * args.entropy_coef).backward()
+                    nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
+                    optimizerCD.step()
+            else:
+                # cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * ((rolloutsD.rewards_INCEPT-rolloutsG.rewards_INCEPT)) * args.d_Incept_loss_coef).mean() - rolloutsD.ents.mean(0) * args.entropy_coef
+                cD_loss = -(rolloutsD.logprobs.mean(0).squeeze(1) * V(
+                    (rolloutsD.rewards_INCEPT - rolloutsG.rewards_INCEPT) - (
+                    rolloutsD.avg_reward_INCEPT - rolloutsG.avg_reward_INCEPT)) * args.d_Incept_loss_coef).mean() - rolloutsD.ents.mean(
+                    0) * args.entropy_coef
+
+                '''^TODO IMMEDIATE: MAKE SURE mean &/or sum of logprobs & ents are correct'''
+
+                # just in case gradient penalty steps caused gradients
+                optimizerCD.zero_grad()
+                nn.utils.clip_grad_norm(cD.parameters(), args.max_grad_norm)
+                cD_loss.backward()
+
+                optimizerCD.step()
 
             # rolloutsD.update_avg_reward_GAN()
             rolloutsD.update_avg_reward_INCEPT()
