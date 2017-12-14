@@ -109,6 +109,10 @@ def get_args():
                         help='whether to optimize loss function')
     parser.add_argument('--loss-mix', type=bool, default=False,
                         help='whether to optimize mixed loss function')
+    
+    parser.add_argument('--ppo', type=str2bool, default=False)
+    parser.add_argument('--ppo-epochs', type=int, default=5)
+    
     args = parser.parse_args()
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
