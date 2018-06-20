@@ -1,4 +1,7 @@
-# x
+# ENAS_GAN
+###### collaboration between: [Ethan Caballero](https://github.com/ethancaballero) & [Aran Komatsuzaki](https://github.com/AranKomat)
+
+This is an attempt to use [ENAS](https://arxiv.org/abs/1802.03268) to find optimal GAN architectures. Unfortunately, ENAS seems to be unable to find useful GAN architectures.
 
 First download CIFAR-10 python version from https://www.cs.toronto.edu/~kriz/cifar.html to obtain folder cifar-10-batches-py/
 
